@@ -1,0 +1,185 @@
+import ast
+
+def tcr_from_ast(node, is_target=False):
+
+    if isinstance(node, ast.Call):
+        func = tcr_from_ast(node.func)
+        args = [tcr_from_ast(arg) for arg in node.args]
+        return ['function_call', func, args]
+
+    elif isinstance(node, ast.Attribute):
+        value = tcr_from_ast(node.value)
+        return ['attribute', node.attr, value]
+    
+    elif isinstance(node, ast.Index):
+            # If the node is an index (e.g., ['results'])
+            return ['index', tcr_from_ast(node.value)]
+    
+    elif isinstance(node, ast.Slice):
+            # If it is a slice (e.g., [:10])
+            lower = tcr_from_ast(node.lower) if node.lower else ""
+            upper = tcr_from_ast(node.upper) if node.upper else ""
+            if lower !="" and upper !="":
+                 strg = f"Return values between positions {node.lower.value + 1} and {node.upper.value}"
+            elif lower != "":
+                 strg = f"Return values in positions lower than {node.lower.value + 1}"
+            elif upper != "":
+                 strg = f"Return the top {node.upper.value} values"
+            else:
+                 strg = ""
+            return ['slice', strg]
+            
+    elif isinstance(node, ast.ListComp):
+        elt = tcr_from_ast(node.elt)
+        generators = []
+        for gen in node.generators:
+            target = tcr_from_ast(gen.target, is_target=True)
+            iter = tcr_from_ast(gen.iter)
+            if_condition = [tcr_from_ast(cond) for cond in gen.ifs]
+            generators.append(['comprehension', target, iter, if_condition])
+        return ['list_comp', elt, generators]
+
+
+    elif isinstance(node, ast.comprehension):
+        target = tcr_from_ast(node.target, is_target=True)
+        iter = tcr_from_ast(node.iter)
+        ifs = [tcr_from_ast(cond) for cond in node.ifs]
+        return ['comprehension', target, iter, ifs]
+
+    elif isinstance(node, ast.Str):
+        if is_target:
+            return ['loop_var', node.value]
+        else:
+            return ['object', node.value]
+    elif isinstance(node, ast.Name):
+        # If the name is the target of a comprehension, treat it as a loop variable
+        if is_target:
+            return ['loop_var', node.id]
+        else:
+            return ['object', node.id]
+    elif isinstance(node, ast.Constant):
+        return ['constant', node.value]
+    elif isinstance(node, ast.Expr):
+        return tcr_from_ast(node.value)
+    elif isinstance(node, ast.Subscript):
+        # If the node is a subscript (e.g., ['results'][:10])
+        value_steps = tcr_from_ast(node.value)
+        slice_steps = tcr_from_ast(node.slice)
+        return ['subscript', slice_steps, value_steps]
+    else:
+        return []
+
+
+def generate_utterance(tcr):
+    steps = []
+
+    if not tcr:
+        return steps
+
+    elif tcr[0] == 'function_call':
+        if tcr[1][0] == 'attribute':
+            obj_steps = generate_utterance(tcr[1][2])
+            steps.extend(obj_steps)
+            if "Call" in obj_steps[-1]:
+                steps.append(f"Call the '{tcr[1][1]}' method")
+            else:
+                steps.append(f"Call the '{tcr[1][1]}' method on the '{obj_steps[-1].replace('--object', '')}' object")
+        else:
+            steps.append(f"Call the '{tcr[1]}' function")
+
+    elif tcr[0] == 'attribute':
+        value_steps = generate_utterance(tcr[2])
+        steps.extend(value_steps)
+        steps.append(f"access the '{tcr[1]}' attribute")
+
+    elif tcr[0] == 'subscript':
+        value_steps = generate_utterance(tcr[2])
+        steps.extend(value_steps)
+        slice_steps = generate_utterance(tcr[1])
+        steps.extend(slice_steps)
+        
+    elif tcr[0] == 'assign':
+        target_utterance = generate_utterance(tcr[1])
+        value_utterance = generate_utterance(tcr[2])
+        steps.extend(target_utterance)
+        steps.extend(value_utterance)
+
+    elif tcr[0] == 'string':
+        steps.append('Access the ' + tcr[1].replace('--object', '') + ' object')
+
+    elif tcr[0] == 'constant':
+        if tcr[1] == 0:
+            steps.append(f'Return the top value')
+        else:
+            steps.append(f'Get value at index {tcr[1]}')
+
+    elif tcr[0] == 'index':
+        steps.append(f'“Get value at index {tcr[1]}”')
+
+    elif tcr[0] == 'object':
+        steps.append(tcr[1] + "--object")
+
+    elif tcr[0] == 'slice':
+        steps.append(tcr[1])
+        
+    elif tcr[0] == 'list_comp':
+        element = generate_utterance(tcr[1])
+        iter_steps = generate_utterance(tcr[2][0])
+        steps.extend(iter_steps)
+        strg=''
+        for el in element:
+            strg += "'" + el + "'"
+        steps.append(f"For each item returned, extract the value of the {strg.replace('--object', '')}")
+            
+    elif tcr[0] == 'comprehension':
+        iter = generate_utterance(tcr[2])
+        if iter:
+            steps.extend(iter)
+
+    final_steps = []
+    for step in steps:
+        if step == 'str':
+            continue
+        elif step == 'len':
+            final_steps.append('get length')
+        else:
+            final_steps.append(step)
+
+    return final_steps
+
+def process_multiline_code(code_sample):
+    print("CODE SAMPLE:\t" + code_sample)
+    # Parse the multi-line code sample into individual statements
+    parsed_code = ast.parse(code_sample)
+    
+    # Iterate over each statement and generate the corresponding utterance
+    global all_steps
+    all_steps = []
+    
+    for stmt in parsed_code.body:
+        tcr = tcr_from_ast(stmt)
+        steps = generate_utterance(tcr)
+        for step in steps:
+            if '--object' in step:
+                all_steps.append('Access the ' + step.replace('--object', '') + ' object')
+            else:
+                all_steps.append(step)
+    
+    return all_steps
+
+# Some sample test cases that can be run 
+code_samples = ["[movie['title'] for movie in tmdb.Movies().top_rated()['results'][:10]]",
+                "[movie['id'] for movie in tmdb.Movies().now_playing()['results']]",
+                "[movie['original language'] for movie in tmdb.Movies().popular()[:3]]",
+                "[genre['name'] for genre in tmdb.Movies().top_rated()[0]['genres']]"
+]
+
+def main():
+    for code in code_samples:
+        steps = process_multiline_code(code)
+        for i, step in enumerate(steps):
+            print(f"({i+1}) {step}")
+        print("\n\n")
+
+if __name__=="__main__":
+    main()
